@@ -1,61 +1,47 @@
 
 import asyncio
-import datetime as dt
 import json
 import os
 import pathlib
-import random
 import re
 import subprocess
 import time
-import urllib.parse
+from io import BytesIO
+
 import requests
 import edge_tts
-import feedparser
-
-from PIL import Image, ImageOps
-from io import BytesIO
+from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 
 ROOT = pathlib.Path(__file__).parent
 WORK = ROOT / "work"
 HISTORY = ROOT / "history.json"
 
-LANG = os.getenv("LANGUAGE", "fa")
+LANG = os.getenv("LANGUAGE", "fa").lower()
 VOICE = os.getenv("TTS_VOICE", "fa-IR-FaridNeural")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-MODE = os.getenv("MODE", "auto")
-DRY_RUN = True
-
-# قفل سخت: تا تأیید کیفیت، هیچ آپلودی انجام نمی‌شود.
-UPLOAD_ENABLED = False
+FONT_DIR = os.getenv("FONT_DIR", "/usr/share/fonts/truetype/noto")
 
 W, H = 1080, 1920
 FPS = 30
-FONT_DIR = "/usr/share/fonts/truetype/noto"
-
-FEEDS = [
-    "https://hnrss.org/frontpage?points=150",
-    "https://www.theverge.com/rss/index.xml",
-    "https://feeds.arstechnica.com/arstechnica/index",
-    "https://techcrunch.com/feed/",
-    "https://www.wired.com/feed/rss",
-]
+MAX_SCENES = 6
+MIN_SCENES = 5
+UPLOAD_ENABLED = False
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "TrendifyVideoStudio/1.0 (educational video production)"
+    "User-Agent": "TrendifyAnimeStudio/1.0"
 })
 
 
 def log(*args):
-    print("[trendify]", *args, flush=True)
+    print("[Trendify Anime]", *args, flush=True)
 
 
-def run_ffmpeg(args):
+def run_ffmpeg(args, timeout=300):
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args],
         check=True,
-        timeout=240,
+        timeout=timeout,
     )
 
 
@@ -68,56 +54,22 @@ def load_history():
 
 def save_history(history):
     HISTORY.write_text(
-        json.dumps(history[-300:], ensure_ascii=False, indent=2),
+        json.dumps(history[-100:], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
-def fetch_news(history):
-    used = {x.get("link") for x in history}
-    items = []
-
-    for url in FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:10]:
-                link = entry.get("link", "")
-                title = entry.get("title", "")
-                if not link or link in used or not title:
-                    continue
-
-                summary = re.sub(
-                    r"<[^>]+>", "", entry.get("summary", "")
-                )[:500]
-
-                items.append({
-                    "title": title,
-                    "summary": summary,
-                    "link": link,
-                })
-        except Exception as exc:
-            log("RSS error:", url, str(exc)[:180])
-
-    random.shuffle(items)
-    return items[:25]
-
-
-def pick_mode():
-    if MODE in ("news", "story"):
-        return MODE
-    return "news" if dt.date.today().toordinal() % 2 == 0 else "story"
-
-
-def call_llm(prompt):
-    key = os.getenv("GEMINI_API_KEY")
+def call_gemini(prompt):
+    key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("GEMINI_API_KEY is missing")
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing in GitHub repository secrets."
+        )
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{LLM_MODEL}:generateContent"
     )
-
     response = SESSION.post(
         url,
         params={"key": key},
@@ -125,457 +77,266 @@ def call_llm(prompt):
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "temperature": 0.65,
+                "temperature": 0.9,
             },
         },
         timeout=120,
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"Gemini API error {response.status_code}: "
+            f"{response.text[:500]}"
+        )
 
-    data = response.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError):
-        raise RuntimeError("Gemini returned no usable script")
+        raise RuntimeError("Gemini returned no usable story JSON.")
 
 
-def make_plan(mode, news, history):
-    past = [x.get("topic_key", "") for x in history[-60:]]
-
-    if mode == "news":
-        task = (
-            "Choose one significant technology or AI news item from this JSON. "
-            "Use only claims supported by the supplied item. "
-            "Do not infer political bias or motives without strong evidence. "
-            "Preserve the original source URL.\n"
-            + json.dumps(news, ensure_ascii=False)
-        )
-    else:
-        task = (
-            "Create an engaging, factually conservative story about technology, "
-            "computing, internet history or AI. Use well-documented facts."
-        )
-
+def make_story(history):
+    previous = [x.get("title", "") for x in history[-12:]]
     language = "Persian (Farsi)" if LANG == "fa" else "English"
 
     prompt = f"""
-You are a professional documentary Shorts writer.
-Narration language: {language}.
-{task}
+You are the lead writer and visual director of Trendify Anime,
+a short-form original science-fiction anime studio.
 
-Avoid previously covered topic keys: {past}
+Write ONE original fictional anime short in {language}.
+Audience: curious teens and adults who like technology, AI and mysteries.
 
-Return valid JSON only, with this exact structure:
+STORY CONCEPT:
+A young programmer receives a message from an AI that predicts tomorrow.
+The first prediction comes true. The next prediction is terrifying.
+Create an original plot and a memorable twist.
+
+STORY RULES:
+- 5 or 6 scenes, total narration around 42-55 seconds.
+- Scene 1 must hook the viewer immediately.
+- Clear escalation, emotional stakes, climax, surprising but logical ending.
+- Every scene must advance the same story.
+- Natural, concise spoken narration in {language}.
+- No factual claims presented as real news.
+- Avoid titles too similar to these previous titles: {previous}
+- Do not put spoken dialogue in quotation marks unless it is actually narrated.
+- Keep character identities, clothing, hair and colors consistent.
+- Visuals should feel like premium cinematic Japanese anime,
+  hand-painted backgrounds, expressive faces, dramatic lighting,
+  detailed line art, atmospheric depth, film composition.
+- No text, captions, logos, watermarks or letters in images.
+
+Return valid JSON only:
 {{
- "title": "short title",
- "description": "description with source link when relevant",
- "hashtags": ["#technology", "#AI"],
- "topic_key": "short-english-slug",
- "source_link": "",
- "scenes": [
-   {{
-     "narration": "natural spoken narration",
-     "image_prompt": "specific English visual description",
-     "search_terms": "short English keywords for finding real footage"
-   }}
- ]
+  "title": "short title",
+  "description": "short video description",
+  "topic_key": "unique-short-slug",
+  "character_bible": "Detailed fixed appearance of the protagonist and any recurring character",
+  "scenes": [
+    {{
+      "narration": "spoken narration for this scene",
+      "visual": "Specific visual description of this exact story moment",
+      "camera": "one simple cinematic camera movement",
+      "mood": "emotional tone"
+    }}
+  ]
 }}
-
-Rules:
-- 35 to 55 seconds of spoken narration in total.
-- 5 to 7 scenes, approximately 6 to 10 seconds each.
-- Narration must be natural and easy to speak.
-- The opening must create curiosity without misleading viewers.
-- Visual prompts describe real objects, locations or actions, not abstract gradients.
-- No text, lettering or watermarks inside generated images.
-- Each scene must have distinct visual search terms.
-- Do not invent statistics, quotations or sources.
-- Use a concise title, a useful description and 3 to 5 relevant hashtags.
 """
 
-    raw = call_llm(prompt).strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-    plan = json.loads(raw)
+    raw = call_gemini(prompt).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        plan = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Gemini returned invalid JSON: {exc}")
 
     scenes = plan.get("scenes")
-    if not isinstance(scenes, list) or not 4 <= len(scenes) <= 7:
-        raise RuntimeError("Script must contain 4-7 scenes")
+    if not isinstance(scenes, list) or not MIN_SCENES <= len(scenes) <= MAX_SCENES:
+        raise RuntimeError("Story must contain 5 or 6 scenes.")
 
-    for scene in scenes:
-        if not scene.get("narration", "").strip():
-            raise RuntimeError("A scene has empty narration")
-        if not scene.get("image_prompt", "").strip():
-            raise RuntimeError("A scene has no visual prompt")
+    if not plan.get("character_bible", "").strip():
+        raise RuntimeError("Story has no character design description.")
+
+    for i, scene in enumerate(scenes, 1):
+        for field in ("narration", "visual", "camera", "mood"):
+            if not str(scene.get(field, "")).strip():
+                raise RuntimeError(f"Scene {i} is missing '{field}'.")
 
     return plan
 
 
-async def make_tts(text, output_path):
-    await edge_tts.Communicate(
-        text, VOICE, rate="+0%"
-    ).save(str(output_path))
+def anime_prompt(plan, scene, index):
+    character = plan["character_bible"]
+    visual = scene["visual"]
+    camera = scene["camera"]
+    mood = scene["mood"]
 
-
-def audio_duration(path):
-    result = subprocess.check_output([
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ], timeout=30)
-    return float(result.decode().strip())
-
-
-def search_terms(text):
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{2,}", text)
-    stop = {
-        "cinematic", "highly", "detailed", "vertical", "realistic",
-        "professional", "beautiful", "dramatic", "without", "text",
-    }
-    terms = [w for w in words if w.lower() not in stop]
-    return " ".join(terms[:7]) or "technology science"
-
-
-def commons_search(query, want_video):
-    if want_video:
-        prefixes = ["filemime:video"]
-        fallbacks = [
-            "technology computer",
-            "computer server",
-            "science laboratory",
-        ]
-    else:
-        prefixes = ["filemime:bitmap", ""]
-        fallbacks = [
-            "technology computer",
-            "cybersecurity computer",
-            "artificial intelligence",
-            "computer server",
-            "science laboratory",
-        ]
-
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{2,}", query)
-    short_queries = [
-        " ".join(words[:3]),
-        " ".join(words[:2]),
-    ]
-
-    searches = []
-    for q in [query, *short_queries, *fallbacks]:
-        q = q.strip()
-        if q and q not in searches:
-            searches.append(q)
-
-    candidates = []
-    seen = set()
-
-    for q in searches:
-        if len(candidates) >= 12:
-            break
-
-        for prefix in prefixes:
-            search_text = f"{prefix} {q}".strip()
-
-            try:
-                response = SESSION.get(
-                    "https://commons.wikimedia.org/w/api.php",
-                    params={
-                        "action": "query",
-                        "format": "json",
-                        "generator": "search",
-                        "gsrsearch": search_text,
-                        "gsrnamespace": 6,
-                        "gsrlimit": 10,
-                        "prop": "imageinfo",
-                        "iiprop": "url|extmetadata",
-                        "iiurlwidth": 1200,
-                    },
-                    timeout=25,
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                pages = data.get("query", {}).get("pages", {})
-                for page in pages.values():
-                    info_list = page.get("imageinfo", [])
-                    if not info_list:
-                        continue
-
-                    info = info_list[0]
-                    url = info.get("url", "")
-                    thumb = info.get("thumburl", "")
-                    title = page.get("title", "")
-
-                    if not url or url in seen:
-                        continue
-
-                    is_video = bool(
-                        re.search(
-                            r"\.(mp4|webm|mov|ogv)(?:$|\?)",
-                            urllib.parse.urlparse(url).path,
-                            re.I,
-                        )
-                    )
-
-                    if want_video and not is_video:
-                        continue
-                    if not want_video and (is_video or not thumb):
-                        continue
-
-                    metadata = info.get("extmetadata", {})
-                    license_name = metadata.get(
-                        "LicenseShortName", {}
-                    ).get("value", "")
-                    license_url = metadata.get(
-                        "LicenseUrl", {}
-                    ).get("value", "")
-                    artist = metadata.get(
-                        "Artist", {}
-                    ).get("value", "")
-
-                    candidates.append({
-                        "title": title,
-                        "url": url,
-                        "thumb": thumb,
-                        "license": re.sub(
-                            r"<[^>]+>", "", license_name
-                        ),
-                        "license_url": license_url,
-                        "artist": re.sub(
-                            r"<[^>]+>", "", artist
-                        ),
-                    })
-                    seen.add(url)
-
-                if candidates:
-                    break
-
-            except Exception as exc:
-                log(
-                    "Commons search error:",
-                    search_text,
-                    str(exc)[:160],
-                )
-
-    random.shuffle(candidates)
-    log(
-        "Commons results:",
-        len(candidates),
-        "type:",
-        "video" if want_video else "image",
+    return (
+        "Original Japanese anime film still, premium theatrical anime art, "
+        "beautiful hand-painted background, clean expressive line art, "
+        "detailed character illustration, dramatic cinematic lighting, "
+        "rich but controlled colors, atmospheric perspective, "
+        "carefully composed vertical portrait frame, 9:16 composition. "
+        f"CHARACTER CONTINUITY - keep this exact design: {character}. "
+        f"SCENE {index + 1}: {visual}. "
+        f"CAMERA AND COMPOSITION: {camera}. "
+        f"EMOTION AND LIGHTING: {mood}. "
+        "Maintain the same face, hairstyle, age, clothing, accessories and "
+        "color palette as the character description. "
+        "One coherent scene, polished anime key visual, "
+        "no text, no letters, no subtitles, no logo, no watermark."
     )
-    return candidates
-
-def download_limited(url, path, max_bytes=30 * 1024 * 1024):
-    with SESSION.get(url, stream=True, timeout=(15, 45)) as response:
-        response.raise_for_status()
-
-        declared = response.headers.get("Content-Length")
-        if declared and int(declared) > max_bytes:
-            raise RuntimeError("Media file exceeds size limit")
-
-        total = 0
-        with open(path, "wb") as output:
-            for chunk in response.iter_content(1024 * 256):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > max_bytes:
-                    raise RuntimeError("Media download exceeded size limit")
-                output.write(chunk)
-
-    if path.stat().st_size < 2048:
-        raise RuntimeError("Downloaded media is unexpectedly small")
-
-
-def commons_video(query, index):
-    for item in commons_search(query, True)[:3]:
-        try:
-            ext = pathlib.Path(
-                urllib.parse.urlparse(item["url"]).path
-            ).suffix.lower()
-            if ext not in {".mp4", ".webm", ".mov", ".ogv"}:
-                continue
-
-            path = WORK / f"source_{index}{ext}"
-            download_limited(item["url"], path)
-
-            # Validate that FFmpeg can read the downloaded media.
-            subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries",
-                 "format=duration", "-of", "csv=p=0", str(path)],
-                check=True, capture_output=True, timeout=25,
-            )
-            return path, item
-        except Exception as exc:
-            log("Commons video unavailable:", str(exc)[:140])
-
-    return None, None
-
-
-def commons_image(query, index):
-    for item in commons_search(query, False)[:3]:
-        try:
-            response = SESSION.get(item["thumb"], timeout=35)
-            response.raise_for_status()
-            image = Image.open(BytesIO(response.content)).convert("RGB")
-            image = ImageOps.fit(image, (W, H))
-            path = WORK / f"source_{index}.jpg"
-            image.save(path, quality=92)
-            return path, item
-        except Exception as exc:
-            log("Commons image unavailable:", str(exc)[:140])
-
-    return None, None
 
 
 def ai_horde_image(prompt, index):
     key = os.getenv("AI_HORDE_API_KEY", "").strip()
-    key_source = "configured" if key else "anonymous"
-
     headers = {
         "apikey": key or "0000000000",
-        "Client-Agent": "TrendifyVideoStudio:1.0:github",
+        "Client-Agent": "TrendifyAnimeStudio:1.0:github",
         "Content-Type": "application/json",
     }
-
     payload = {
-        "prompt": (
-            prompt
-            + ", cinematic documentary photography, realistic lighting, "
-              "vertical composition, no text, no logos"
-        ),
+        "prompt": prompt,
         "params": {
             "sampler_name": "k_euler",
             "cfg_scale": 7,
             "width": 512,
             "height": 768,
-            "steps": 20,
+            "steps": 24,
             "n": 1,
         },
         "nsfw": False,
         "censor_nsfw": True,
     }
 
-    try:
-        response = SESSION.post(
-            "https://aihorde.net/api/v2/generate/async",
-            headers=headers,
-            json=payload,
-            timeout=40,
+    response = SESSION.post(
+        "https://aihorde.net/api/v2/generate/async",
+        headers=headers,
+        json=payload,
+        timeout=45,
+    )
+    if not response.ok:
+        detail = response.text[:400]
+        if key:
+            detail = detail.replace(key, "[REDACTED]")
+        raise RuntimeError(
+            f"AI Horde rejected scene {index + 1}: "
+            f"HTTP {response.status_code}: {detail}"
         )
 
-        if not response.ok:
-            detail = response.text[:500]
-            if key:
-                detail = detail.replace(key, "[REDACTED]")
+    request_id = response.json().get("id")
+    if not request_id:
+        raise RuntimeError("AI Horde returned no generation ID.")
 
-            log(
-                "AI Horde HTTP error:",
-                response.status_code,
-                "key source:",
-                key_source,
-                "response:",
-                detail,
-            )
-            return None
+    log(f"Waiting for anime art, scene {index + 1}...")
+    deadline = time.monotonic() + 240
 
-        request_id = response.json().get("id")
-        if not request_id:
-            log("AI Horde returned no request ID")
-            return None
-
-        for _ in range(15):
-            time.sleep(8)
-            check = SESSION.get(
-                f"https://aihorde.net/api/v2/generate/check/{request_id}",
-                headers=headers,
-                timeout=25,
-            )
-            check.raise_for_status()
-            state = check.json()
-
-            if state.get("faulted"):
-                log("AI Horde generation faulted")
-                return None
-
-            if state.get("done"):
-                break
-        else:
-            log("AI Horde queue timed out")
-            return None
-
-        result = SESSION.get(
-            f"https://aihorde.net/api/v2/generate/status/{request_id}",
+    while time.monotonic() < deadline:
+        time.sleep(8)
+        check = SESSION.get(
+            f"https://aihorde.net/api/v2/generate/check/{request_id}",
             headers=headers,
             timeout=30,
         )
-        result.raise_for_status()
+        check.raise_for_status()
+        state = check.json()
 
-        generations = result.json().get("generations", [])
-        if not generations:
-            log("AI Horde returned no generated images")
-            return None
+        if state.get("faulted"):
+            raise RuntimeError(
+                f"AI Horde generation failed for scene {index + 1}."
+            )
+        if state.get("done"):
+            break
+    else:
+        raise RuntimeError(
+            f"AI Horde queue timeout for scene {index + 1}. "
+            "Try running the workflow again later."
+        )
 
-        image_url = generations[0].get("img", "")
-        if not image_url.startswith("https://"):
-            log("AI Horde returned an invalid image URL")
-            return None
+    result = SESSION.get(
+        f"https://aihorde.net/api/v2/generate/status/{request_id}",
+        headers=headers,
+        timeout=35,
+    )
+    result.raise_for_status()
+    generations = result.json().get("generations", [])
+    if not generations:
+        raise RuntimeError("AI Horde returned no generated image.")
 
-        image_response = SESSION.get(image_url, timeout=45)
-        image_response.raise_for_status()
+    image_url = generations[0].get("img", "")
+    if not image_url.startswith("https://"):
+        raise RuntimeError("AI Horde returned an invalid image URL.")
 
-        image = Image.open(
-            BytesIO(image_response.content)
-        ).convert("RGB")
-        image = ImageOps.fit(image, (W, H))
+    image_response = SESSION.get(image_url, timeout=45)
+    image_response.raise_for_status()
 
-        path = WORK / f"ai_{index}.jpg"
-        image.save(path, quality=92)
-        log("AI image generated for scene", index + 1)
-        return path
-
+    try:
+        image = Image.open(BytesIO(image_response.content)).convert("RGB")
     except Exception as exc:
-        log("AI image unavailable:", str(exc)[:250])
-        return None
+        raise RuntimeError(f"Generated image could not be opened: {exc}")
+
+    path = WORK / f"anime_{index:02d}.jpg"
+    image.save(path, quality=94)
+    log(f"Anime artwork ready for scene {index + 1}.")
+    return path
 
 
-def obtain_media(scene, index):
-    query = search_terms(
-        scene.get("search_terms", "") + " " + scene["image_prompt"]
+def make_portrait_canvas(image_path, output_path):
+    """Keep the entire artwork visible; blur the background to fill 9:16."""
+    with Image.open(image_path) as source:
+        source = ImageOps.exif_transpose(source).convert("RGB")
+
+    background = ImageOps.fit(
+        source, (W, H), method=Image.Resampling.LANCZOS
+    )
+    background = background.filter(ImageFilter.GaussianBlur(34))
+    background = ImageEnhance.Brightness(background).enhance(0.48)
+    background = ImageEnhance.Color(background).enhance(0.8)
+
+    foreground = ImageOps.contain(
+        source,
+        (W, H),
+        method=Image.Resampling.LANCZOS,
     )
 
-    # Prefer real video footage.
-    video, video_info = commons_video(query, index)
-    if video:
-        return "video", video, video_info
+    x = (W - foreground.width) // 2
+    y = (H - foreground.height) // 2
+    background.paste(foreground, (x, y))
+    background.save(output_path, quality=94)
+    return output_path
 
-    # Otherwise use a freely licensed real photograph.
-    image, image_info = commons_image(query, index)
-    if image:
-        return "image", image, image_info
 
-    # Finally attempt a generated image.
-    image = ai_horde_image(scene["image_prompt"], index)
-    if image:
-        return "image", image, {
-            "title": "AI-generated image",
-            "license": "AI-generated",
-            "license_url": "",
-            "artist": "Trendify",
-        }
+async def make_tts(text, output_path):
+    await edge_tts.Communicate(
+        text,
+        VOICE,
+        rate="+0%",
+    ).save(str(output_path))
 
-    raise RuntimeError(
-        f"No usable footage or image found for scene {index + 1}. "
-        "Refusing to create a colored-gradient placeholder."
+
+def audio_duration(path):
+    result = subprocess.check_output(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        timeout=30,
     )
+    return float(result.decode().strip())
 
 
-def split_phrases(text, max_words=6):
+def ass_time(seconds):
+    cs = max(0, int(seconds * 100))
+    hours, rest = divmod(cs, 360000)
+    minutes, rest = divmod(rest, 6000)
+    secs, centiseconds = divmod(rest, 100)
+    return f"{hours}:{minutes:02}:{secs:02}.{centiseconds:02}"
+
+
+def split_phrases(text, max_words=5):
     text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return []
-
     sentences = re.split(r"(?<=[.!?؟؛])\s+", text)
     phrases = []
 
@@ -585,42 +346,12 @@ def split_phrases(text, max_words=6):
             phrase = " ".join(words[start:start + max_words])
             if phrase:
                 phrases.append(phrase)
-
     return phrases
 
 
-def ass_time(seconds):
-    centiseconds = max(0, int(seconds * 100))
-    hours, rest = divmod(centiseconds, 360000)
-    minutes, rest = divmod(rest, 6000)
-    secs, cs = divmod(rest, 100)
-    return f"{hours}:{minutes:02}:{secs:02}.{cs:02}"
-
-
-def ass_wrap(text, max_chars=26):
-    words = text.split()
-    lines = []
-    current = ""
-
-    for word in words:
-        candidate = (current + " " + word).strip()
-        if len(candidate) <= max_chars or not current:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    # Maximum two lines; prefer shorter phrases over tiny text.
-    return r"\N".join(lines[:2])
-
-
-def create_ass(subtitle_events):
+def create_ass(events):
     path = WORK / "subtitles.ass"
-
-    header = """[Script Info]
+    header = r"""[Script Info]
 ScriptType: v4.00+
 WrapStyle: 2
 ScaledBorderAndShadow: yes
@@ -629,214 +360,198 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Noto Sans Arabic,48,&H00FFFFFF,&H0000FFFF,&H00101010,&H80000000,1,0,1,3,1,2,90,90,260,1
+Style: Default,Noto Sans Arabic,49,&H00FFFFFF,&H0000FFFF,&H00101010,&H90000000,1,0,1,3,1,2,90,90,250,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-
     rows = []
-    for start, end, text in subtitle_events:
-        text = text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+    for start, end, text in events:
+        text = (
+            text.replace("\\", r"\\")
+                .replace("{", r"\{")
+                .replace("}", r"\}")
+        )
         rows.append(
             f"Dialogue: 0,{ass_time(start)},{ass_time(end)},"
-            f"Default,,0,0,0,,{ass_wrap(text)}"
+            f"Default,,0,0,0,,{text}"
         )
 
     path.write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
     return path
 
 
-
-def render_scene(media_kind, media_path, audio_path, output_path, duration):
-    # Vertical Shorts canvas: 1080x1920.
-    # Keep the complete source image/video visible; use a blurred
-    # background to fill the canvas instead of cropping the subject.
-
-    if media_kind == "video":
-        video_filter = (
-            # Background layer: fill portrait canvas and blur it.
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},boxblur=20:10,"
-            "eq=brightness=-0.12:saturation=0.85[bg];"
-            # Foreground layer: fit the entire source inside the canvas.
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            "setsar=1[fg];"
-            # Center the full source over the blurred background.
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-            f"fps={FPS},setsar=1,format=yuv420p[v]"
-        )
-
-        run_ffmpeg([
-            "-stream_loop", "-1", "-i", str(media_path),
-            "-i", str(audio_path),
-            "-filter_complex", video_filter,
-            "-map", "[v]", "-map", "1:a:0",
-            "-t", f"{duration:.3f}",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            str(output_path),
-        ])
-
+def render_scene(canvas_path, audio_path, output_path, duration, camera):
+    # All frames start from a complete portrait canvas.
+    # Zoom is deliberately subtle so the main subject stays visible.
+    direction = str(camera).lower()
+    if any(word in direction for word in ("left", "pan left", "move left")):
+        x_expr = "iw/2-(iw/zoom/2)-min((zoom-1)*iw*0.18,iw*0.04)"
+    elif any(word in direction for word in ("right", "pan right", "move right")):
+        x_expr = "iw/2-(iw/zoom/2)+min((zoom-1)*iw*0.18,iw*0.04)"
     else:
-        # Still image: same portrait layout with blurred background.
-        frames = max(1, int(duration * FPS))
+        x_expr = "iw/2-(iw/zoom/2)"
 
-        video_filter = (
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},boxblur=20:10,"
-            "eq=brightness=-0.12:saturation=0.85[bg];"
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            "setsar=1[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-            # Subtle zoom while keeping the full image visible.
-            f"zoompan=z='min(zoom+0.0003,1.04)':"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-            f"d={frames}:s={W}x{H}:fps={FPS},"
-            "setsar=1,format=yuv420p[v]"
-        )
+    frames = max(1, int(duration * FPS))
+    vf = (
+        "zoompan="
+        "z='min(zoom+0.00018,1.045)':"
+        f"x='{x_expr}':"
+        "y='ih/2-(ih/zoom/2)':"
+        f"d={frames}:s={W}x{H}:fps={FPS},"
+        "setsar=1,format=yuv420p"
+    )
 
-        run_ffmpeg([
-            "-loop", "1", "-framerate", str(FPS),
-            "-i", str(media_path),
-            "-i", str(audio_path),
-            "-filter_complex", video_filter,
-            "-map", "[v]", "-map", "1:a:0",
-            "-t", f"{duration:.3f}",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            str(output_path),
-        ])
-
+    run_ffmpeg([
+        "-loop", "1",
+        "-framerate", str(FPS),
+        "-i", str(canvas_path),
+        "-i", str(audio_path),
+        "-vf", vf,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(output_path),
+    ], timeout=360)
 
 
 def build_video(plan):
-    WORK.mkdir(parents=True, exist_ok=True)
     clips = []
-    credits = []
     subtitle_events = []
     timeline = 0.0
+    credits = []
 
     for index, scene in enumerate(plan["scenes"]):
-        log(f"Scene {index + 1}/{len(plan['scenes'])}: acquiring media")
+        log(f"Creating scene {index + 1}/{len(plan['scenes'])}")
 
-        audio = WORK / f"audio_{index}.mp3"
+        prompt = anime_prompt(plan, scene, index)
+        artwork = ai_horde_image(prompt, index)
+
+        canvas = WORK / f"canvas_{index:02d}.jpg"
+        make_portrait_canvas(artwork, canvas)
+
+        audio = WORK / f"voice_{index:02d}.mp3"
         asyncio.run(make_tts(scene["narration"], audio))
         duration = audio_duration(audio)
 
         if duration <= 0:
-            raise RuntimeError("Invalid narration audio duration")
-
-        kind, media, info = obtain_media(scene, index)
-        credits.append({
-            "scene": index + 1,
-            "kind": kind,
-            "title": info.get("title", ""),
-            "artist": info.get("artist", ""),
-            "license": info.get("license", ""),
-            "license_url": info.get("license_url", ""),
-            "url": info.get("url", ""),
-        })
+            raise RuntimeError(f"Invalid narration duration in scene {index + 1}.")
 
         phrases = split_phrases(scene["narration"])
         if not phrases:
-            raise RuntimeError("Empty subtitle text")
+            raise RuntimeError(f"No subtitle phrases in scene {index + 1}.")
 
         weights = [max(1, len(p)) for p in phrases]
         total_weight = sum(weights)
-        phrase_start = timeline
+        cursor = timeline
 
         for phrase, weight in zip(phrases, weights):
-            phrase_duration = duration * weight / total_weight
-            subtitle_events.append((
-                phrase_start,
-                phrase_start + phrase_duration,
-                phrase,
-            ))
-            phrase_start += phrase_duration
+            part = duration * weight / total_weight
+            subtitle_events.append((cursor, cursor + part, phrase))
+            cursor += part
 
-        clip = WORK / f"scene_{index}.mp4"
-        render_scene(kind, media, audio, clip, duration)
+        clip = WORK / f"scene_{index:02d}.mp4"
+        render_scene(canvas, audio, clip, duration, scene["camera"])
         clips.append(clip)
+
+        credits.append({
+            "scene": index + 1,
+            "source": "AI Horde community image generation",
+            "story_visual": scene["visual"],
+            "prompt": prompt,
+        })
         timeline += duration
 
     if not clips:
-        raise RuntimeError("No scenes were rendered")
+        raise RuntimeError("No scenes were rendered.")
 
     concat_list = WORK / "concat.txt"
     concat_list.write_text(
-        "".join(f"file '{p.name}'\n" for p in clips),
+        "".join(f"file '{clip.name}'\n" for clip in clips),
         encoding="utf-8",
     )
 
-    raw_video = WORK / "raw.mp4"
+    raw = WORK / "raw.mp4"
     run_ffmpeg([
-        "-f", "concat", "-safe", "0", "-i", str(concat_list),
-        "-c", "copy", str(raw_video),
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy",
+        str(raw),
     ])
 
-    subtitle_path = create_ass(subtitle_events)
+    subtitles = create_ass(subtitle_events)
     output = WORK / "short.mp4"
 
+    # Escape the path for FFmpeg's subtitles filter.
+    subtitle_filter_path = str(subtitles.resolve()).replace("\\", "/")
+    subtitle_filter_path = subtitle_filter_path.replace(":", r"\:")
+
     run_ffmpeg([
-        "-i", str(raw_video),
-        "-vf", f"subtitles={subtitle_path}:fontsdir={FONT_DIR}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-i", str(raw),
+        "-vf", f"subtitles='{subtitle_filter_path}':fontsdir='{FONT_DIR}'",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(output),
-    ])
+    ], timeout=600)
 
     final_duration = audio_duration(output)
     if final_duration < 10 or final_duration > 59:
         raise RuntimeError(
-            f"Output duration {final_duration:.1f}s is outside the Shorts target"
+            f"Video is {final_duration:.1f}s; Shorts test target is 10-59s. "
+            "Adjust narration length and run again."
         )
 
     (WORK / "media_credits.json").write_text(
         json.dumps(credits, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    (WORK / "story.json").write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-    log(f"Video ready: {final_duration:.1f}s")
+    log(f"Video ready: {final_duration:.1f} seconds")
     log(f"Output: {output}")
-    log("Media credits saved to work/media_credits.json")
-    return output
+    return output, final_duration
 
 
 def main():
     WORK.mkdir(parents=True, exist_ok=True)
+
+    # Never publish automatically in this quality-test version.
     history = load_history()
-    mode = pick_mode()
+    plan = make_story(history)
+    log("Story:", plan.get("title", "Untitled"))
 
-    log("Mode:", mode)
-    news = fetch_news(history) if mode == "news" else []
+    output, duration = build_video(plan)
 
-    if mode == "news" and not news:
-        log("No new RSS items; switching to story mode")
-        mode = "story"
+    history.append({
+        "title": plan.get("title", ""),
+        "topic_key": plan.get("topic_key", ""),
+        "duration": round(duration, 2),
+    })
+    save_history(history)
 
-    plan = make_plan(mode, news, history)
-    log("Title:", plan["title"])
-
-    video = build_video(plan)
-
-    # Quality gate: upload stays disabled in this revision.
-    if not UPLOAD_ENABLED:
-        log("QUALITY GATE: YouTube upload is disabled.")
-        log("Download the short.mp4 artifact and review it before enabling publishing.")
-        return
-
-    raise RuntimeError(
-        "Upload code intentionally unavailable until quality is approved."
-    )
+    log("QUALITY GATE: YouTube upload is disabled.")
+    log(f"Review the artifact containing: {output.name}")
+    log("Also inspect work/story.json and work/media_credits.json.")
+    if UPLOAD_ENABLED:
+        raise RuntimeError("Publishing is not implemented in this version.")
 
 
 if __name__ == "__main__":
