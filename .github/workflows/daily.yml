@@ -26,8 +26,9 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      
       - name: Install FFmpeg and fonts
-       run: |
+        run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
           ffmpeg -version
