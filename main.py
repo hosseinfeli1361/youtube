@@ -1,7 +1,4 @@
-"""
-ربات روزانه‌ی یوتیوب شورتس: اخبار تکنولوژی و داستان‌های دنیای دیجیتال
-مراحل: انتخاب موضوع -> اسکریپت با Claude -> صدا (edge-tts) -> تصویر -> ویدیو (ffmpeg) -> آپلود
-"""
+
 import asyncio
 import datetime as dt
 import json
@@ -10,35 +7,31 @@ import pathlib
 import random
 import re
 import subprocess
-import sys
+import time
 import urllib.parse
-
-import arabic_reshaper
+import requests
 import edge_tts
 import feedparser
-import requests
-from bidi.algorithm import get_display
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# ---------------------------------------------------------------- تنظیمات
+from PIL import Image, ImageOps
+from io import BytesIO
+
 ROOT = pathlib.Path(__file__).parent
 WORK = ROOT / "work"
 HISTORY = ROOT / "history.json"
 
-LANG = os.getenv("LANGUAGE", "fa")  # fa, en, ...
-VOICE = os.getenv("TTS_VOICE", "fa-IR-FaridNeural")  # یا fa-IR-DilaraNeural
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")  # gemini (رایگان) | claude (پولی)
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash" if LLM_PROVIDER == "gemini" else "claude-sonnet-5-5")
-PRIVACY = os.getenv("PRIVACY", "private")  # برای تست private؛ بعداً public
-PUBLISH_DELAY_MIN = int(os.getenv("PUBLISH_DELAY_MIN", "0"))  # انتشار دقیق با publishAt
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"  # ۱ = بدون آپلود
-MODE = os.getenv("MODE", "auto")  # auto | news | story
+LANG = os.getenv("LANGUAGE", "fa")
+VOICE = os.getenv("TTS_VOICE", "fa-IR-FaridNeural")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+MODE = os.getenv("MODE", "auto")
+DRY_RUN = True
+
+# قفل سخت: تا تأیید کیفیت، هیچ آپلودی انجام نمی‌شود.
+UPLOAD_ENABLED = False
 
 W, H = 1080, 1920
-RTL = LANG in {"fa", "ar", "he", "ur"}
+FPS = 30
+FONT_DIR = "/usr/share/fonts/truetype/noto"
 
 FEEDS = [
     "https://hnrss.org/frontpage?points=150",
@@ -48,43 +41,63 @@ FEEDS = [
     "https://www.wired.com/feed/rss",
 ]
 
-FONT_CANDIDATES = [
-    os.getenv("FONT_PATH", ""),
-    str(ROOT / "fonts" / "Vazirmatn-Bold.ttf"),
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-]
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "TrendifyVideoStudio/1.0 (educational video production)"
+})
 
 
-def log(*a):
-    print("[bot]", *a, flush=True)
+def log(*args):
+    print("[trendify]", *args, flush=True)
 
 
-# ---------------------------------------------------------------- تاریخچه
+def run_ffmpeg(args):
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args],
+        check=True,
+        timeout=240,
+    )
+
+
 def load_history():
     try:
         return json.loads(HISTORY.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
         return []
 
 
-def save_history(h):
-    HISTORY.write_text(json.dumps(h[-300:], ensure_ascii=False, indent=1), encoding="utf-8")
+def save_history(history):
+    HISTORY.write_text(
+        json.dumps(history[-300:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
-# ---------------------------------------------------------------- ۱) موضوع
 def fetch_news(history):
     used = {x.get("link") for x in history}
     items = []
+
     for url in FEEDS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:8]:
-                link = e.get("link", "")
-                if link and link not in used:
-                    summary = re.sub(r"<[^>]+>", "", e.get("summary", ""))[:400]
-                    items.append({"title": e.get("title", ""), "summary": summary, "link": link})
-        except Exception as ex:
-            log("feed failed", url, ex)
+            for entry in feed.entries[:10]:
+                link = entry.get("link", "")
+                title = entry.get("title", "")
+                if not link or link in used or not title:
+                    continue
+
+                summary = re.sub(
+                    r"<[^>]+>", "", entry.get("summary", "")
+                )[:500]
+
+                items.append({
+                    "title": title,
+                    "summary": summary,
+                    "link": link,
+                })
+        except Exception as exc:
+            log("RSS error:", url, str(exc)[:180])
+
     random.shuffle(items)
     return items[:25]
 
@@ -95,305 +108,608 @@ def pick_mode():
     return "news" if dt.date.today().toordinal() % 2 == 0 else "story"
 
 
-# ---------------------------------------------------------------- ۲) اسکریپت با LLM
 def call_llm(prompt):
-    if LLM_PROVIDER == "claude":
-        import anthropic
-
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model=LLM_MODEL, max_tokens=3000, messages=[{"role": "user", "content": prompt}]
-        )
-        return "".join(b.text for b in resp.content if b.type == "text")
-
-    # Gemini از طریق REST (بدون نیاز به پکیج اضافه)
-    import time
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is missing")
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{LLM_MODEL}:generateContent?key={os.environ['GEMINI_API_KEY']}"
+        f"{LLM_MODEL}:generateContent"
     )
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
-    }
-    r = None
-    for attempt in range(3):
-        r = requests.post(url, json=body, timeout=120)
-        if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(15 * (attempt + 1))
-            continue
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    r.raise_for_status()
+
+    response = SESSION.post(
+        url,
+        params={"key": key},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.65,
+            },
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("Gemini returned no usable script")
 
 
 def make_plan(mode, news, history):
     past = [x.get("topic_key", "") for x in history[-60:]]
-    lang_name = {"fa": "Persian (Farsi)", "en": "English"}.get(LANG, LANG)
 
     if mode == "news":
-        material = json.dumps(news, ensure_ascii=False)
         task = (
-            "From the news items below, pick the single most interesting and significant tech/AI story "
-            "for a general audience. Use ONLY facts present in the item; do not invent numbers, quotes or details. "
-            f"Items:\n{material}"
+            "Choose one significant technology or AI news item from this JSON. "
+            "Use only claims supported by the supplied item. "
+            "Do not infer political bias or motives without strong evidence. "
+            "Preserve the original source URL.\n"
+            + json.dumps(news, ensure_ascii=False)
         )
     else:
         task = (
-            "Tell a fascinating, TRUE story from the world of computers, the internet, hacking history, "
-            "AI or digital culture (e.g. famous bugs, first-of-their-kind events, legendary products, "
-            "surprising origins). Choose only well-documented facts you are highly confident about; "
-            "avoid exact dates/numbers if unsure."
+            "Create an engaging, factually conservative story about technology, "
+            "computing, internet history or AI. Use well-documented facts."
         )
 
-    prompt = f"""You write scripts for a daily YouTube Short (vertical, 35-50 seconds).
+    language = "Persian (Farsi)" if LANG == "fa" else "English"
+
+    prompt = f"""
+You are a professional documentary Shorts writer.
+Narration language: {language}.
 {task}
 
-Avoid these already-covered topics: {past}
+Avoid previously covered topic keys: {past}
+
+Return valid JSON only, with this exact structure:
+{{
+ "title": "short title",
+ "description": "description with source link when relevant",
+ "hashtags": ["#technology", "#AI"],
+ "topic_key": "short-english-slug",
+ "source_link": "",
+ "scenes": [
+   {{
+     "narration": "natural spoken narration",
+     "image_prompt": "specific English visual description",
+     "search_terms": "short English keywords for finding real footage"
+   }}
+ ]
+}}
 
 Rules:
-- Narration language: {lang_name}. Natural spoken style, strong hook in the first sentence, ends with a punchy closing line.
-- Total narration about 90-120 words, split into 5-7 scenes.
-- Each scene: "narration" (spoken), "caption" (on-screen text, max 7 words, same language),
-  "image_prompt" (ENGLISH, vivid cinematic description, no text/letters in image, no real people's faces, no logos).
-- "title": max 90 chars, curiosity-driven, same language, no hashtags.
-- "description": 2-3 sentences + (for news) a line with the source link. No hashtags inside.
-- "hashtags": 4-5 relevant hashtags (include a mix of Persian/English as fits), without #Shorts.
-- "topic_key": short English slug of the topic.
-- "source_link": the link of the chosen item for news, else "".
+- 35 to 55 seconds of spoken narration in total.
+- 5 to 7 scenes, approximately 6 to 10 seconds each.
+- Narration must be natural and easy to speak.
+- The opening must create curiosity without misleading viewers.
+- Visual prompts describe real objects, locations or actions, not abstract gradients.
+- No text, lettering or watermarks inside generated images.
+- Each scene must have distinct visual search terms.
+- Do not invent statistics, quotations or sources.
+- Use a concise title, a useful description and 3 to 5 relevant hashtags.
+"""
 
-Return ONLY valid JSON:
-{{"title":"","description":"","hashtags":["#..."],"topic_key":"","source_link":"",
-"scenes":[{{"narration":"","caption":"","image_prompt":""}}]}}"""
+    raw = call_llm(prompt).strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+    plan = json.loads(raw)
 
-    text = call_llm(prompt)
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-    plan = json.loads(text)
-    assert 3 <= len(plan["scenes"]) <= 9, "unexpected scene count"
+    scenes = plan.get("scenes")
+    if not isinstance(scenes, list) or not 4 <= len(scenes) <= 7:
+        raise RuntimeError("Script must contain 4-7 scenes")
+
+    for scene in scenes:
+        if not scene.get("narration", "").strip():
+            raise RuntimeError("A scene has empty narration")
+        if not scene.get("image_prompt", "").strip():
+            raise RuntimeError("A scene has no visual prompt")
+
     return plan
 
 
-# ---------------------------------------------------------------- ۳) صدا
-async def _tts(text, path):
-    await edge_tts.Communicate(text, VOICE, rate="+5%").save(str(path))
+async def make_tts(text, output_path):
+    await edge_tts.Communicate(
+        text, VOICE, rate="+0%"
+    ).save(str(output_path))
 
 
 def audio_duration(path):
-    out = subprocess.check_output(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)]
+    result = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ], timeout=30)
+    return float(result.decode().strip())
+
+
+def search_terms(text):
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{2,}", text)
+    stop = {
+        "cinematic", "highly", "detailed", "vertical", "realistic",
+        "professional", "beautiful", "dramatic", "without", "text",
+    }
+    terms = [w for w in words if w.lower() not in stop]
+    return " ".join(terms[:7]) or "technology science"
+
+
+def commons_search(query, want_video):
+    mime = "filemime:video" if want_video else "filemime:bitmap"
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": f"{mime} {query}",
+        "gsrnamespace": 6,
+        "gsrlimit": 8,
+        "prop": "imageinfo",
+        "iiprop": "url|extmetadata",
+        "iiurlwidth": 1200,
+    }
+
+    response = SESSION.get(
+        "https://commons.wikimedia.org/w/api.php",
+        params=params,
+        timeout=30,
     )
-    return float(out.decode().strip())
+    response.raise_for_status()
 
+    pages = response.json().get("query", {}).get("pages", {})
+    candidates = []
 
-# ---------------------------------------------------------------- ۴) تصویر
-def shape(text):
-    return get_display(arabic_reshaper.reshape(text)) if RTL else text
+    for page in pages.values():
+        info_list = page.get("imageinfo", [])
+        if not info_list:
+            continue
 
+        info = info_list[0]
+        url = info.get("url", "")
+        thumb = info.get("thumburl", "")
+        title = page.get("title", "")
 
-def get_font(size):
-    for p in FONT_CANDIDATES:
-        if p and pathlib.Path(p).exists():
-            return ImageFont.truetype(p, size)
-    return ImageFont.load_default()
-
-
-def fallback_image():
-    c1 = tuple(random.randint(10, 80) for _ in range(3))
-    c2 = tuple(random.randint(60, 200) for _ in range(3))
-    img = Image.new("RGB", (W, H))
-    px = img.load()
-    for y in range(H):
-        t = y / H
-        col = tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3))
-        for x in range(W):
-            px[x, y] = col
-    return img
-
-
-def get_image(prompt, seed):
-    full = f"{prompt}, vertical cinematic composition, highly detailed, no text"
-    url = (
-        "https://image.pollinations.ai/prompt/"
-        + urllib.parse.quote(full)
-        + f"?width={W}&height={H}&nologo=true&seed={seed}"
-    )
-    for attempt in range(3):
-        try:
-            r = requests.get(url, timeout=120)
-            r.raise_for_status()
-            import io
-
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-            return ImageOps.fit(img, (W, H))
-        except Exception as ex:
-            log("image attempt failed", attempt, ex)
-    return fallback_image()
-
-
-def wrap_text(draw, text, font, max_w):
-    lines, cur = [], ""
-    for word in text.split():
-        trial = (cur + " " + word).strip()
-        if draw.textlength(shape(trial), font=font) <= max_w:
-            cur = trial
+        if want_video:
+            if not re.search(r"\.(mp4|webm|mov|ogv)(?:$|\?)", url, re.I):
+                continue
         else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
-    return lines
+            if not thumb:
+                continue
 
+        metadata = info.get("extmetadata", {})
+        license_name = metadata.get("LicenseShortName", {}).get("value", "")
+        license_url = metadata.get("LicenseUrl", {}).get("value", "")
+        artist = metadata.get("Artist", {}).get("value", "")
 
-def add_caption(img, text):
-    d = ImageDraw.Draw(img, "RGBA")
-    font = get_font(78)
-    lines = wrap_text(d, text, font, 900)
-    lh = 110
-    box_h = lh * len(lines) + 50
-    y0 = H - 380 - box_h
-    d.rounded_rectangle([50, y0, W - 50, y0 + box_h], radius=40, fill=(0, 0, 0, 165))
-    for i, line in enumerate(lines):
-        disp = shape(line)
-        w = d.textlength(disp, font=font)
-        d.text(((W - w) / 2, y0 + 25 + i * lh), disp, font=font, fill="white")
-    return img
-
-
-# ---------------------------------------------------------------- ۵) ویدیو
-def build_video(plan):
-    WORK.mkdir(exist_ok=True)
-    clips = []
-    for i, sc in enumerate(plan["scenes"]):
-        audio = WORK / f"a{i}.mp3"
-        asyncio.run(_tts(sc["narration"], audio))
-        dur = audio_duration(audio) + 0.25
-
-        img = add_caption(get_image(sc["image_prompt"], random.randint(1, 10**6)), sc["caption"])
-        png = WORK / f"i{i}.png"
-        img.save(png)
-
-        clip = WORK / f"c{i}.mp4"
-        frames = int(dur * 30) + 1
-        vf = (
-            f"scale=1296:2304,zoompan=z='min(zoom+0.0007,1.2)':d={frames}"
-            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps=30"
-        )
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-framerate", "30", "-i", str(png),
-             "-i", str(audio), "-t", f"{dur:.2f}", "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-r", "30", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest", str(clip)],
-            check=True,
-        )
-        clips.append(clip)
-
-    lst = WORK / "list.txt"
-    lst.write_text("".join(f"file '{c.name}'\n" for c in clips))
-    out = WORK / "short.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
-         "-c", "copy", str(out)],
-        check=True,
-    )
-    total = audio_duration(out)
-    log(f"video ready: {total:.1f}s")
-    if total > 59:
-        log("WARNING: video longer than 59s")
-    return out
-
-
-# ---------------------------------------------------------------- ۶) آپلود
-def upload(video, plan):
-    creds = Credentials(
-        None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"],
-        scopes=["https://www.googleapis.com/auth/youtube.upload"],
-    )
-    yt = build("youtube", "v3", credentials=creds)
-
-    tags_line = " ".join(plan["hashtags"] + ["#Shorts"])
-    description = f"{plan['description']}\n\n{tags_line}\n\n🤖 AI-generated content"
-    title = plan["title"][:95]
-    tags = [h.lstrip("#") for h in plan["hashtags"]] + ["Shorts"]
-
-    status = {
-        "privacyStatus": PRIVACY,
-        "selfDeclaredMadeForKids": False,
-        "containsSyntheticMedia": True,
-    }
-    if PUBLISH_DELAY_MIN > 0:
-        when = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=PUBLISH_DELAY_MIN)
-        status["privacyStatus"] = "private"
-        status["publishAt"] = when.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    body = {
-        "snippet": {
+        # Commons files are freely licensed/public domain, but preserve
+        # the per-file attribution and license details for review.
+        candidates.append({
             "title": title,
-            "description": description,
-            "tags": tags,
-            "categoryId": "28",  # Science & Technology
-            "defaultLanguage": LANG,
-            "defaultAudioLanguage": LANG,
-        },
-        "status": status,
-    }
-    media = MediaFileUpload(str(video), mimetype="video/mp4", chunksize=-1, resumable=True)
-    req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-    resp = None
-    while resp is None:
-        _, resp = req.next_chunk()
-    return resp["id"]
+            "url": url,
+            "thumb": thumb,
+            "license": re.sub(r"<[^>]+>", "", license_name),
+            "license_url": license_url,
+            "artist": re.sub(r"<[^>]+>", "", artist),
+        })
+
+    random.shuffle(candidates)
+    return candidates
 
 
-def notify(text):
-    token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if token and chat:
+def download_limited(url, path, max_bytes=30 * 1024 * 1024):
+    with SESSION.get(url, stream=True, timeout=(15, 45)) as response:
+        response.raise_for_status()
+
+        declared = response.headers.get("Content-Length")
+        if declared and int(declared) > max_bytes:
+            raise RuntimeError("Media file exceeds size limit")
+
+        total = 0
+        with open(path, "wb") as output:
+            for chunk in response.iter_content(1024 * 256):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("Media download exceeded size limit")
+                output.write(chunk)
+
+    if path.stat().st_size < 2048:
+        raise RuntimeError("Downloaded media is unexpectedly small")
+
+
+def commons_video(query, index):
+    for item in commons_search(query, True)[:3]:
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id": chat, "text": text}, timeout=20,
+            ext = pathlib.Path(
+                urllib.parse.urlparse(item["url"]).path
+            ).suffix.lower()
+            if ext not in {".mp4", ".webm", ".mov", ".ogv"}:
+                continue
+
+            path = WORK / f"source_{index}{ext}"
+            download_limited(item["url"], path)
+
+            # Validate that FFmpeg can read the downloaded media.
+            subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "csv=p=0", str(path)],
+                check=True, capture_output=True, timeout=25,
             )
-        except Exception:
-            pass
+            return path, item
+        except Exception as exc:
+            log("Commons video unavailable:", str(exc)[:140])
+
+    return None, None
 
 
-# ---------------------------------------------------------------- اجرای اصلی
+def commons_image(query, index):
+    for item in commons_search(query, False)[:3]:
+        try:
+            response = SESSION.get(item["thumb"], timeout=35)
+            response.raise_for_status()
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+            image = ImageOps.fit(image, (W, H))
+            path = WORK / f"source_{index}.jpg"
+            image.save(path, quality=92)
+            return path, item
+        except Exception as exc:
+            log("Commons image unavailable:", str(exc)[:140])
+
+    return None, None
+
+
+def ai_horde_image(prompt, index):
+    # Anonymous shared access is best-effort, slow and rate-limited.
+    # Never assume this service will always return an image.
+    headers = {
+        "apikey": os.getenv("AI_HORDE_API_KEY", "0000000000"),
+        "Client-Agent": "TrendifyVideoStudio:1.0:github",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "prompt": (
+            prompt
+            + ", cinematic documentary photography, realistic lighting, "
+              "vertical composition, no text, no logos"
+        ),
+        "params": {
+            "sampler_name": "k_euler",
+            "cfg_scale": 7,
+            "width": 512,
+            "height": 768,
+            "steps": 20,
+            "n": 1,
+        },
+        "nsfw": False,
+        "censor_nsfw": True,
+    }
+
+    try:
+        response = SESSION.post(
+            "https://aihorde.net/api/v2/generate/async",
+            headers=headers, json=payload, timeout=40,
+        )
+        response.raise_for_status()
+        request_id = response.json()["id"]
+
+        for _ in range(15):
+            time.sleep(8)
+            check = SESSION.get(
+                f"https://aihorde.net/api/v2/generate/check/{request_id}",
+                headers=headers, timeout=25,
+            )
+            check.raise_for_status()
+            state = check.json()
+
+            if state.get("faulted"):
+                raise RuntimeError("AI Horde generation failed")
+            if state.get("done"):
+                break
+        else:
+            raise RuntimeError("AI Horde queue timed out")
+
+        result = SESSION.get(
+            f"https://aihorde.net/api/v2/generate/status/{request_id}",
+            headers=headers, timeout=30,
+        )
+        result.raise_for_status()
+        generations = result.json().get("generations", [])
+        if not generations:
+            raise RuntimeError("AI Horde returned no image")
+
+        image_url = generations[0].get("img", "")
+        if not image_url.startswith("https://"):
+            raise RuntimeError("Unexpected AI Horde image URL")
+
+        image_response = SESSION.get(image_url, timeout=45)
+        image_response.raise_for_status()
+        image = Image.open(BytesIO(image_response.content)).convert("RGB")
+        image = ImageOps.fit(image, (W, H))
+        path = WORK / f"ai_{index}.jpg"
+        image.save(path, quality=92)
+        return path
+
+    except Exception as exc:
+        log("AI image unavailable:", str(exc)[:180])
+        return None
+
+
+def obtain_media(scene, index):
+    query = search_terms(
+        scene.get("search_terms", "") + " " + scene["image_prompt"]
+    )
+
+    # Prefer real video footage.
+    video, video_info = commons_video(query, index)
+    if video:
+        return "video", video, video_info
+
+    # Otherwise use a freely licensed real photograph.
+    image, image_info = commons_image(query, index)
+    if image:
+        return "image", image, image_info
+
+    # Finally attempt a generated image.
+    image = ai_horde_image(scene["image_prompt"], index)
+    if image:
+        return "image", image, {
+            "title": "AI-generated image",
+            "license": "AI-generated",
+            "license_url": "",
+            "artist": "Trendify",
+        }
+
+    raise RuntimeError(
+        f"No usable footage or image found for scene {index + 1}. "
+        "Refusing to create a colored-gradient placeholder."
+    )
+
+
+def split_phrases(text, max_words=6):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+
+    sentences = re.split(r"(?<=[.!?؟؛])\s+", text)
+    phrases = []
+
+    for sentence in sentences:
+        words = sentence.split()
+        for start in range(0, len(words), max_words):
+            phrase = " ".join(words[start:start + max_words])
+            if phrase:
+                phrases.append(phrase)
+
+    return phrases
+
+
+def ass_time(seconds):
+    centiseconds = max(0, int(seconds * 100))
+    hours, rest = divmod(centiseconds, 360000)
+    minutes, rest = divmod(rest, 6000)
+    secs, cs = divmod(rest, 100)
+    return f"{hours}:{minutes:02}:{secs:02}.{cs:02}"
+
+
+def ass_wrap(text, max_chars=26):
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        candidate = (current + " " + word).strip()
+        if len(candidate) <= max_chars or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    # Maximum two lines; prefer shorter phrases over tiny text.
+    return r"\N".join(lines[:2])
+
+
+def create_ass(subtitle_events):
+    path = WORK / "subtitles.ass"
+
+    header = """[Script Info]
+ScriptType: v4.00+
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans Arabic,48,&H00FFFFFF,&H0000FFFF,&H00101010,&H80000000,1,0,1,3,1,2,90,90,260,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    rows = []
+    for start, end, text in subtitle_events:
+        text = text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+        rows.append(
+            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},"
+            f"Default,,0,0,0,,{ass_wrap(text)}"
+        )
+
+    path.write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
+    return path
+
+
+def render_scene(media_kind, media_path, audio_path, output_path, duration):
+    if media_kind == "video":
+        video_filter = (
+            f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={FPS},setsar=1,format=yuv420p"
+        )
+        run_ffmpeg([
+            "-stream_loop", "-1", "-i", str(media_path),
+            "-i", str(audio_path),
+            "-t", f"{duration:.3f}",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", video_filter,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+            "-ac", "2", "-shortest", str(output_path),
+        ])
+    else:
+        frames = max(1, int(duration * FPS))
+        video_filter = (
+            f"scale={W * 1.2}:{H * 1.2}:force_original_aspect_ratio=increase,"
+            f"crop={W * 1.2}:{H * 1.2},"
+            f"zoompan=z='min(zoom+0.0005,1.10)':"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"d={frames}:s={W}x{H}:fps={FPS},"
+            "setsar=1,format=yuv420p"
+        )
+        run_ffmpeg([
+            "-loop", "1", "-framerate", str(FPS), "-i", str(media_path),
+            "-i", str(audio_path),
+            "-t", f"{duration:.3f}",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", video_filter,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+            "-ac", "2", "-shortest", str(output_path),
+        ])
+
+
+def build_video(plan):
+    WORK.mkdir(parents=True, exist_ok=True)
+    clips = []
+    credits = []
+    subtitle_events = []
+    timeline = 0.0
+
+    for index, scene in enumerate(plan["scenes"]):
+        log(f"Scene {index + 1}/{len(plan['scenes'])}: acquiring media")
+
+        audio = WORK / f"audio_{index}.mp3"
+        asyncio.run(make_tts(scene["narration"], audio))
+        duration = audio_duration(audio)
+
+        if duration <= 0:
+            raise RuntimeError("Invalid narration audio duration")
+
+        kind, media, info = obtain_media(scene, index)
+        credits.append({
+            "scene": index + 1,
+            "kind": kind,
+            "title": info.get("title", ""),
+            "artist": info.get("artist", ""),
+            "license": info.get("license", ""),
+            "license_url": info.get("license_url", ""),
+            "url": info.get("url", ""),
+        })
+
+        phrases = split_phrases(scene["narration"])
+        if not phrases:
+            raise RuntimeError("Empty subtitle text")
+
+        weights = [max(1, len(p)) for p in phrases]
+        total_weight = sum(weights)
+        phrase_start = timeline
+
+        for phrase, weight in zip(phrases, weights):
+            phrase_duration = duration * weight / total_weight
+            subtitle_events.append((
+                phrase_start,
+                phrase_start + phrase_duration,
+                phrase,
+            ))
+            phrase_start += phrase_duration
+
+        clip = WORK / f"scene_{index}.mp4"
+        render_scene(kind, media, audio, clip, duration)
+        clips.append(clip)
+        timeline += duration
+
+    if not clips:
+        raise RuntimeError("No scenes were rendered")
+
+    concat_list = WORK / "concat.txt"
+    concat_list.write_text(
+        "".join(f"file '{p.name}'\n" for p in clips),
+        encoding="utf-8",
+    )
+
+    raw_video = WORK / "raw.mp4"
+    run_ffmpeg([
+        "-f", "concat", "-safe", "0", "-i", str(concat_list),
+        "-c", "copy", str(raw_video),
+    ])
+
+    subtitle_path = create_ass(subtitle_events)
+    output = WORK / "short.mp4"
+
+    run_ffmpeg([
+        "-i", str(raw_video),
+        "-vf", f"subtitles={subtitle_path}:fontsdir={FONT_DIR}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(output),
+    ])
+
+    final_duration = audio_duration(output)
+    if final_duration < 10 or final_duration > 59:
+        raise RuntimeError(
+            f"Output duration {final_duration:.1f}s is outside the Shorts target"
+        )
+
+    (WORK / "media_credits.json").write_text(
+        json.dumps(credits, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    log(f"Video ready: {final_duration:.1f}s")
+    log(f"Output: {output}")
+    log("Media credits saved to work/media_credits.json")
+    return output
+
+
 def main():
+    WORK.mkdir(parents=True, exist_ok=True)
     history = load_history()
     mode = pick_mode()
-    log("mode:", mode)
+
+    log("Mode:", mode)
     news = fetch_news(history) if mode == "news" else []
+
     if mode == "news" and not news:
+        log("No new RSS items; switching to story mode")
         mode = "story"
+
     plan = make_plan(mode, news, history)
-    log("title:", plan["title"])
+    log("Title:", plan["title"])
 
     video = build_video(plan)
 
-    if DRY_RUN:
-        log("DRY_RUN: skipping upload ->", video)
+    # Quality gate: upload stays disabled in this revision.
+    if not UPLOAD_ENABLED:
+        log("QUALITY GATE: YouTube upload is disabled.")
+        log("Download the short.mp4 artifact and review it before enabling publishing.")
         return
-    vid = upload(video, plan)
-    url = f"https://youtube.com/shorts/{vid}"
-    log("uploaded:", url)
 
-    history.append({
-        "date": dt.date.today().isoformat(),
-        "topic_key": plan.get("topic_key", ""),
-        "link": plan.get("source_link", ""),
-        "video_id": vid,
-    })
-    save_history(history)
-    notify(f"✅ شورت امروز آپلود شد:\n{plan['title']}\n{url}")
+    raise RuntimeError(
+        "Upload code intentionally unavailable until quality is approved."
+    )
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        notify(f"❌ خطا در ربات شورتس: {e}")
+    except Exception as exc:
+        log("FATAL:", str(exc))
         raise
