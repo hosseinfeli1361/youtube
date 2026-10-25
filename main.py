@@ -647,44 +647,73 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return path
 
 
+
 def render_scene(media_kind, media_path, audio_path, output_path, duration):
+    # Vertical Shorts canvas: 1080x1920.
+    # Keep the complete source image/video visible; use a blurred
+    # background to fill the canvas instead of cropping the subject.
+
     if media_kind == "video":
         video_filter = (
-            f"scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},fps={FPS},setsar=1,format=yuv420p"
+            # Background layer: fill portrait canvas and blur it.
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},boxblur=20:10,"
+            "eq=brightness=-0.12:saturation=0.85[bg];"
+            # Foreground layer: fit the entire source inside the canvas.
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            "setsar=1[fg];"
+            # Center the full source over the blurred background.
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+            f"fps={FPS},setsar=1,format=yuv420p[v]"
         )
+
         run_ffmpeg([
             "-stream_loop", "-1", "-i", str(media_path),
             "-i", str(audio_path),
+            "-filter_complex", video_filter,
+            "-map", "[v]", "-map", "1:a:0",
             "-t", f"{duration:.3f}",
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-vf", video_filter,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-            "-ac", "2", "-shortest", str(output_path),
+            "-ac", "2",
+            "-movflags", "+faststart",
+            str(output_path),
         ])
+
     else:
+        # Still image: same portrait layout with blurred background.
         frames = max(1, int(duration * FPS))
+
         video_filter = (
-            f"scale={W * 1.2}:{H * 1.2}:force_original_aspect_ratio=increase,"
-            f"crop={W * 1.2}:{H * 1.2},"
-            f"zoompan=z='min(zoom+0.0005,1.10)':"
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},boxblur=20:10,"
+            "eq=brightness=-0.12:saturation=0.85[bg];"
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            "setsar=1[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+            # Subtle zoom while keeping the full image visible.
+            f"zoompan=z='min(zoom+0.0003,1.04)':"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
             f"d={frames}:s={W}x{H}:fps={FPS},"
-            "setsar=1,format=yuv420p"
+            "setsar=1,format=yuv420p[v]"
         )
+
         run_ffmpeg([
-            "-loop", "1", "-framerate", str(FPS), "-i", str(media_path),
+            "-loop", "1", "-framerate", str(FPS),
+            "-i", str(media_path),
             "-i", str(audio_path),
+            "-filter_complex", video_filter,
+            "-map", "[v]", "-map", "1:a:0",
             "-t", f"{duration:.3f}",
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-vf", video_filter,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-            "-ac", "2", "-shortest", str(output_path),
+            "-ac", "2",
+            "-movflags", "+faststart",
+            str(output_path),
         ])
+
 
 
 def build_video(plan):
