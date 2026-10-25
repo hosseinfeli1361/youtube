@@ -26,15 +26,13 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+           
       - name: Install FFmpeg and subtitle fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            fonts-noto-core \
-            fonts-noto-extra \
-            fonts-noto-naskh-arabic
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
           fc-match "Noto Sans Arabic"
+          fc-match "Noto Naskh Arabic"
           ffmpeg -version
 
       - name: Install Python dependencies
