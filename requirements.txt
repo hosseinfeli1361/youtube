@@ -1,0 +1,10 @@
+# anthropic   # فقط اگر LLM_PROVIDER=claude بخوای، این خط رو فعال کن
+edge-tts
+feedparser
+requests
+Pillow
+arabic-reshaper
+python-bidi
+google-api-python-client
+google-auth
+google-auth-oauthlib
