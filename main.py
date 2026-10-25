@@ -237,65 +237,134 @@ def search_terms(text):
 
 
 def commons_search(query, want_video):
-    mime = "filemime:video" if want_video else "filemime:bitmap"
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": f"{mime} {query}",
-        "gsrnamespace": 6,
-        "gsrlimit": 8,
-        "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
-        "iiurlwidth": 1200,
-    }
+    if want_video:
+        prefixes = ["filemime:video"]
+        fallbacks = [
+            "technology computer",
+            "computer server",
+            "science laboratory",
+        ]
+    else:
+        prefixes = ["filemime:bitmap", ""]
+        fallbacks = [
+            "technology computer",
+            "cybersecurity computer",
+            "artificial intelligence",
+            "computer server",
+            "science laboratory",
+        ]
 
-    response = SESSION.get(
-        "https://commons.wikimedia.org/w/api.php",
-        params=params,
-        timeout=30,
-    )
-    response.raise_for_status()
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]{2,}", query)
+    short_queries = [
+        " ".join(words[:3]),
+        " ".join(words[:2]),
+    ]
 
-    pages = response.json().get("query", {}).get("pages", {})
+    searches = []
+    for q in [query, *short_queries, *fallbacks]:
+        q = q.strip()
+        if q and q not in searches:
+            searches.append(q)
+
     candidates = []
+    seen = set()
 
-    for page in pages.values():
-        info_list = page.get("imageinfo", [])
-        if not info_list:
-            continue
+    for q in searches:
+        if len(candidates) >= 12:
+            break
 
-        info = info_list[0]
-        url = info.get("url", "")
-        thumb = info.get("thumburl", "")
-        title = page.get("title", "")
+        for prefix in prefixes:
+            search_text = f"{prefix} {q}".strip()
 
-        if want_video:
-            if not re.search(r"\.(mp4|webm|mov|ogv)(?:$|\?)", url, re.I):
-                continue
-        else:
-            if not thumb:
-                continue
+            try:
+                response = SESSION.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "format": "json",
+                        "generator": "search",
+                        "gsrsearch": search_text,
+                        "gsrnamespace": 6,
+                        "gsrlimit": 10,
+                        "prop": "imageinfo",
+                        "iiprop": "url|extmetadata",
+                        "iiurlwidth": 1200,
+                    },
+                    timeout=25,
+                )
+                response.raise_for_status()
+                data = response.json()
 
-        metadata = info.get("extmetadata", {})
-        license_name = metadata.get("LicenseShortName", {}).get("value", "")
-        license_url = metadata.get("LicenseUrl", {}).get("value", "")
-        artist = metadata.get("Artist", {}).get("value", "")
+                pages = data.get("query", {}).get("pages", {})
+                for page in pages.values():
+                    info_list = page.get("imageinfo", [])
+                    if not info_list:
+                        continue
 
-        # Commons files are freely licensed/public domain, but preserve
-        # the per-file attribution and license details for review.
-        candidates.append({
-            "title": title,
-            "url": url,
-            "thumb": thumb,
-            "license": re.sub(r"<[^>]+>", "", license_name),
-            "license_url": license_url,
-            "artist": re.sub(r"<[^>]+>", "", artist),
-        })
+                    info = info_list[0]
+                    url = info.get("url", "")
+                    thumb = info.get("thumburl", "")
+                    title = page.get("title", "")
+
+                    if not url or url in seen:
+                        continue
+
+                    is_video = bool(
+                        re.search(
+                            r"\.(mp4|webm|mov|ogv)(?:$|\?)",
+                            urllib.parse.urlparse(url).path,
+                            re.I,
+                        )
+                    )
+
+                    if want_video and not is_video:
+                        continue
+                    if not want_video and (is_video or not thumb):
+                        continue
+
+                    metadata = info.get("extmetadata", {})
+                    license_name = metadata.get(
+                        "LicenseShortName", {}
+                    ).get("value", "")
+                    license_url = metadata.get(
+                        "LicenseUrl", {}
+                    ).get("value", "")
+                    artist = metadata.get(
+                        "Artist", {}
+                    ).get("value", "")
+
+                    candidates.append({
+                        "title": title,
+                        "url": url,
+                        "thumb": thumb,
+                        "license": re.sub(
+                            r"<[^>]+>", "", license_name
+                        ),
+                        "license_url": license_url,
+                        "artist": re.sub(
+                            r"<[^>]+>", "", artist
+                        ),
+                    })
+                    seen.add(url)
+
+                if candidates:
+                    break
+
+            except Exception as exc:
+                log(
+                    "Commons search error:",
+                    search_text,
+                    str(exc)[:160],
+                )
 
     random.shuffle(candidates)
+    log(
+        "Commons results:",
+        len(candidates),
+        "type:",
+        "video" if want_video else "image",
+    )
     return candidates
-
 
 def download_limited(url, path, max_bytes=30 * 1024 * 1024):
     with SESSION.get(url, stream=True, timeout=(15, 45)) as response:
@@ -361,10 +430,11 @@ def commons_image(query, index):
 
 
 def ai_horde_image(prompt, index):
-    # Anonymous shared access is best-effort, slow and rate-limited.
-    # Never assume this service will always return an image.
+    key = os.getenv("AI_HORDE_API_KEY", "").strip()
+    key_source = "configured" if key else "anonymous"
+
     headers = {
-        "apikey": os.getenv("AI_HORDE_API_KEY", "0000000000"),
+        "apikey": key or "0000000000",
         "Client-Agent": "TrendifyVideoStudio:1.0:github",
         "Content-Type": "application/json",
     }
@@ -390,50 +460,83 @@ def ai_horde_image(prompt, index):
     try:
         response = SESSION.post(
             "https://aihorde.net/api/v2/generate/async",
-            headers=headers, json=payload, timeout=40,
+            headers=headers,
+            json=payload,
+            timeout=40,
         )
-        response.raise_for_status()
-        request_id = response.json()["id"]
+
+        if not response.ok:
+            detail = response.text[:500]
+            if key:
+                detail = detail.replace(key, "[REDACTED]")
+
+            log(
+                "AI Horde HTTP error:",
+                response.status_code,
+                "key source:",
+                key_source,
+                "response:",
+                detail,
+            )
+            return None
+
+        request_id = response.json().get("id")
+        if not request_id:
+            log("AI Horde returned no request ID")
+            return None
 
         for _ in range(15):
             time.sleep(8)
             check = SESSION.get(
                 f"https://aihorde.net/api/v2/generate/check/{request_id}",
-                headers=headers, timeout=25,
+                headers=headers,
+                timeout=25,
             )
             check.raise_for_status()
             state = check.json()
 
             if state.get("faulted"):
-                raise RuntimeError("AI Horde generation failed")
+                log("AI Horde generation faulted")
+                return None
+
             if state.get("done"):
                 break
         else:
-            raise RuntimeError("AI Horde queue timed out")
+            log("AI Horde queue timed out")
+            return None
 
         result = SESSION.get(
             f"https://aihorde.net/api/v2/generate/status/{request_id}",
-            headers=headers, timeout=30,
+            headers=headers,
+            timeout=30,
         )
         result.raise_for_status()
+
         generations = result.json().get("generations", [])
         if not generations:
-            raise RuntimeError("AI Horde returned no image")
+            log("AI Horde returned no generated images")
+            return None
 
         image_url = generations[0].get("img", "")
         if not image_url.startswith("https://"):
-            raise RuntimeError("Unexpected AI Horde image URL")
+            log("AI Horde returned an invalid image URL")
+            return None
 
         image_response = SESSION.get(image_url, timeout=45)
         image_response.raise_for_status()
-        image = Image.open(BytesIO(image_response.content)).convert("RGB")
+
+        image = Image.open(
+            BytesIO(image_response.content)
+        ).convert("RGB")
         image = ImageOps.fit(image, (W, H))
+
         path = WORK / f"ai_{index}.jpg"
         image.save(path, quality=92)
+        log("AI image generated for scene", index + 1)
         return path
 
     except Exception as exc:
-        log("AI image unavailable:", str(exc)[:180])
+        log("AI image unavailable:", str(exc)[:250])
         return None
 
 
