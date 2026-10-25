@@ -29,11 +29,11 @@ jobs:
       - name: Install FFmpeg and subtitle fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
             ffmpeg \
             fonts-noto-core \
             fonts-noto-extra \
-            fonts-noto-naskh-arabic
+            fonts-noto-core
           fc-match "Noto Sans Arabic"
           ffmpeg -version
 
