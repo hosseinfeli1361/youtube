@@ -188,21 +188,24 @@ def anime_prompt(plan, scene, index):
     )
 
 
+
 def ai_horde_image(prompt, index):
     key = os.getenv("AI_HORDE_API_KEY", "").strip()
+
     headers = {
         "apikey": key or "0000000000",
         "Client-Agent": "TrendifyAnimeStudio:1.0:github",
         "Content-Type": "application/json",
     }
+
     payload = {
         "prompt": prompt,
         "params": {
             "sampler_name": "k_euler",
-            "cfg_scale": 7,
+            "cfg_scale": 6,
             "width": 512,
-            "height": 768,
-            "steps": 24,
+            "height": 512,
+            "steps": 12,
             "n": 1,
         },
         "nsfw": False,
@@ -215,10 +218,19 @@ def ai_horde_image(prompt, index):
         json=payload,
         timeout=45,
     )
+
     if not response.ok:
         detail = response.text[:400]
         if key:
             detail = detail.replace(key, "[REDACTED]")
+
+        if response.status_code == 403 and "KudosUpfront" in detail:
+            raise RuntimeError(
+                "AI Horde requires Kudos for this image request, "
+                "even at the reduced resolution. No image was generated. "
+                "Try again later or use another free image-generation provider."
+            )
+
         raise RuntimeError(
             f"AI Horde rejected scene {index + 1}: "
             f"HTTP {response.status_code}: {detail}"
@@ -233,6 +245,7 @@ def ai_horde_image(prompt, index):
 
     while time.monotonic() < deadline:
         time.sleep(8)
+
         check = SESSION.get(
             f"https://aihorde.net/api/v2/generate/check/{request_id}",
             headers=headers,
@@ -245,6 +258,7 @@ def ai_horde_image(prompt, index):
             raise RuntimeError(
                 f"AI Horde generation failed for scene {index + 1}."
             )
+
         if state.get("done"):
             break
     else:
@@ -259,6 +273,7 @@ def ai_horde_image(prompt, index):
         timeout=35,
     )
     result.raise_for_status()
+
     generations = result.json().get("generations", [])
     if not generations:
         raise RuntimeError("AI Horde returned no generated image.")
@@ -271,12 +286,17 @@ def ai_horde_image(prompt, index):
     image_response.raise_for_status()
 
     try:
-        image = Image.open(BytesIO(image_response.content)).convert("RGB")
+        image = Image.open(
+            BytesIO(image_response.content)
+        ).convert("RGB")
     except Exception as exc:
-        raise RuntimeError(f"Generated image could not be opened: {exc}")
+        raise RuntimeError(
+            f"Generated image could not be opened: {exc}"
+        )
 
     path = WORK / f"anime_{index:02d}.jpg"
     image.save(path, quality=94)
+
     log(f"Anime artwork ready for scene {index + 1}.")
     return path
 
