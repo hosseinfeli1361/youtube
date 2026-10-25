@@ -1,5 +1,5 @@
 
-name: daily-short
+name: Trendify Anime Quality Test
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: trendify-video-test
+  group: trendify-anime-quality-test
   cancel-in-progress: false
 
 jobs:
@@ -26,13 +26,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-           
       - name: Install FFmpeg and subtitle fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
+          sudo apt-get install -y \
+            ffmpeg \
+            fonts-noto-core \
+            fonts-noto-extra \
+            fonts-noto-naskh-arabic
           fc-match "Noto Sans Arabic"
-          fc-match "Noto Naskh Arabic"
           ffmpeg -version
 
       - name: Install Python dependencies
@@ -40,31 +42,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate video - upload disabled
+      - name: Generate anime short - upload disabled
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           AI_HORDE_API_KEY: ${{ secrets.AI_HORDE_API_KEY }}
           LANGUAGE: fa
           TTS_VOICE: fa-IR-FaridNeural
           LLM_MODEL: gemini-2.5-flash
-          MODE: news
           FONT_DIR: /usr/share/fonts/truetype/noto
+          MODE: anime_story
           DRY_RUN: "1"
         run: |
-          python main.py
+          python -u main.py
           test -s work/short.mp4
           ffprobe -v error \
             -show_entries format=duration,size \
             -of default=noprint_wrappers=1 \
             work/short.mp4
 
-      - name: Save MP4 and media credits
+      - name: Save video and story files
         if: ${{ always() && hashFiles('work/short.mp4') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: trendify-quality-test-${{ github.run_number }}
+          name: trendify-anime-test-${{ github.run_number }}
           path: |
             work/short.mp4
+            work/story.json
             work/media_credits.json
             work/subtitles.ass
           if-no-files-found: warn
